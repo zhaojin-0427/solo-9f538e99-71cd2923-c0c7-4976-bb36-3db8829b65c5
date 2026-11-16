@@ -6,6 +6,7 @@ import sqlite3
 from .database import immediate_tx
 from .models import BatchCreate, ResultCreate, TaxonomyCreate
 from .resolver import resolve_name
+from . import sync
 
 
 class ConflictError(Exception):
@@ -96,7 +97,18 @@ def create_taxonomy_revision(
             "INSERT INTO synonym_edge(revision_id, synonym, target) VALUES (?, ?, ?)",
             [(revision_id, e.synonym, e.target) for e in payload.synonym_edges],
         )
-        # 整版更正：旧修订标记 superseded，引用旧修订的有效结果立即过期
+        # 整版更正：旧修订标记 superseded，引用旧修订的有效结果立即过期。
+        # 先定格更正前的当前供数，撤下组与更正操作在同一事务内整组提交：
+        # 旧供数先撤下，当前修订的结果重新生成后才会发布新归属。
+        active_rows = conn.execute(
+            """
+            SELECT result_id, batch_id
+              FROM result
+             WHERE status = 'active' AND revision_id != ?
+             ORDER BY batch_id
+            """,
+            (revision_id,),
+        ).fetchall()
         conn.execute(
             """
             UPDATE taxonomy_revision
@@ -113,6 +125,8 @@ def create_taxonomy_revision(
             """,
             (revision_id,),
         )
+        # 分类表更正须撤下旧供数：每个受影响批次生成一个撤下变更组
+        sync.insert_correction_groups(conn, active_rows)
     return revision_id
 
 
@@ -235,7 +249,12 @@ def generate_result(conn: sqlite3.Connection, payload: ResultCreate) -> int:
                 "UPDATE result SET status = 'expired' WHERE result_id = ?",
                 (result_id,),
             )
+            # 显式对旧修订生成的结果不是当前供数，不改变同步内容，不产生变更组
         else:
+            # 先在写锁内基于最新已提交的流状态计算变更组并推进物化状态，
+            # 再顶替旧 active：保证并发的同修订生成不会基于过期状态重复发布，
+            # 流重放状态与快照始终一致；归属未变时不产生同步组。
+            sync.insert_generation_group(conn, payload.batch_id, result_id)
             conn.execute(
                 """
                 UPDATE result

@@ -68,6 +68,43 @@ CREATE TABLE IF NOT EXISTS result_item (
     reason           TEXT,
     PRIMARY KEY (result_id, line_no)
 );
+
+-- 供数同步：变更组（水位）与组内变更。
+-- watermark 为单调递增的水位；一个组对应一次更正或一次生成，
+-- 写入与触发它的业务操作处于同一 IMMEDIATE 事务，整组可见、失败整体回滚。
+CREATE TABLE IF NOT EXISTS sync_change_group (
+    watermark         INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_type        TEXT NOT NULL CHECK (group_type IN ('generation', 'correction')),
+    batch_id          INTEGER NOT NULL REFERENCES observation_batch(id),
+    trigger_result_id INTEGER REFERENCES result(result_id),
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS sync_change (
+    group_id         INTEGER NOT NULL REFERENCES sync_change_group(watermark) ON DELETE CASCADE,
+    batch_id         INTEGER NOT NULL REFERENCES observation_batch(id),
+    observation_code TEXT NOT NULL,
+    line_no          INTEGER NOT NULL,
+    change_type      TEXT NOT NULL CHECK (change_type IN ('withdrawn', 'upsert')),
+    accepted_name    TEXT,
+    result_id        INTEGER REFERENCES result(result_id),
+    change_seq       INTEGER NOT NULL,
+    PRIMARY KEY (group_id, change_seq)
+);
+
+-- 同步流的物化状态：当前可供数（最新水位处下游应持有的归属）。
+-- 与变更组在同一 IMMEDIATE 事务内更新，因此快照与水位始终一致。
+CREATE TABLE IF NOT EXISTS sync_supply_state (
+    batch_id         INTEGER NOT NULL REFERENCES observation_batch(id),
+    observation_code TEXT NOT NULL,
+    line_no          INTEGER NOT NULL,
+    accepted_name    TEXT NOT NULL,
+    result_id        INTEGER NOT NULL REFERENCES result(result_id),
+    PRIMARY KEY (batch_id, observation_code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_change_locator
+    ON sync_change(batch_id, observation_code);
 """
 
 
@@ -105,3 +142,20 @@ def immediate_tx(conn: sqlite3.Connection):
     except Exception:
         conn.rollback()
         raise
+
+
+@contextlib.contextmanager
+def read_tx(conn: sqlite3.Connection):
+    """只读快照事务：快照与水位在同一事务内读取，保证彼此一致。
+
+    连接默认隔离级别下首个 SELECT 自动开启延迟事务；这里显式
+    BEGIN（若事务已存在则复用），结束时回滚释放读锁，绝不写入。
+    """
+    in_tx = conn.in_transaction
+    if not in_tx:
+        conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        if not in_tx:
+            conn.rollback()

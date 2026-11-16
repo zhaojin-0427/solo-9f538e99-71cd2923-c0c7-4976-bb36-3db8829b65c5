@@ -129,3 +129,52 @@ class ResultSummaryOut(BaseModel):
 
 class ResultDetailOut(ResultSummaryOut):
     items: list[ResultItemOut]
+
+
+# ---------- 供数同步模型 ----------
+
+class SyncSupplyItemOut(BaseModel):
+    """快照中的一条当前可供数记录，用批次号 + 观测编号定位。"""
+    batch_id: int
+    line_no: int
+    observation_code: str
+    accepted_name: str
+    result_id: int
+
+
+class SyncSnapshotOut(BaseModel):
+    """首次读取：当前已纳入观测全量 + 与之同点的水位。"""
+    watermark: int
+    supply_count: int
+    supply: list[SyncSupplyItemOut]
+
+
+class SyncChangeOut(BaseModel):
+    """组内一条变更：撤下（withdrawn）或新归属（upsert）。"""
+    group_id: int
+    batch_id: int
+    observation_code: str
+    line_no: int
+    change_type: str
+    accepted_name: str | None
+    result_id: int | None
+    change_seq: int
+
+
+class SyncGroupOut(BaseModel):
+    watermark: int
+    group_type: str
+    batch_id: int
+    trigger_result_id: int | None
+    created_at: str
+    changes: list[SyncChangeOut]
+
+
+class SyncChangesOut(BaseModel):
+    """按水位续读的响应：本次领取的变更组与续读水位。"""
+    after: int
+    watermark: int
+    has_more: bool
+    group_count: int
+    change_count: int
+    groups: list[SyncGroupOut]

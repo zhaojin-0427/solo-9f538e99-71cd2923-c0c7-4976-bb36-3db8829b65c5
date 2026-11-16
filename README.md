@@ -31,6 +31,28 @@
   `expired`，**旧修订永远不会覆盖当前供数**；任何失败整体回滚，不产生部分结果。
 - 同一批次新生成的当前结果会使该批次旧的 `active` 结果过期，保证每批次至多一份当前供数。
 
+### 供数同步（变更组 + 水位）
+
+下游分布统计程序通过同步流观测「当前可供数」，分类表更正后不会沿用已撤下的物种归属。
+
+- `GET /sync/supply` **首次读取**：返回当前各批次已纳入供数的观测全量快照，以及与之同点的
+  当前水位 `watermark`。快照与水位在同一只读事务内读取，保证一致。
+- `GET /sync/changes?after=<水位>` **续读**：返回水位严格大于 `after` 的变更组（支持 `limit`
+  分页，`has_more` 提示是否还有组）。把响应里的 `watermark` 作为下一次的 `after` 即可续读，
+  不漏组；同一水位重复请求永远返回同一组（幂等）。
+- 记录用**批次号 `batch_id` + 观测编号 `observation_code`** 定位。组内每条变更给出：
+  - `upsert`：新的接受名 `accepted_name` 与结果号 `result_id`（首次纳入或归属变化）；
+  - `withdrawn`：撤下，`accepted_name` 为空，同时携带撤下前的接受名与结果号。
+- 变更组分两类，均在触发它的业务事务内整组写入：
+  - `correction`：分类表更正时，先把受影响批次的当前供数**整组撤下**；
+  - `generation`：当前修订的结果生成后，再发布新归属（与同步流当前状态做整组 diff，
+    归属未变不发组）。
+- **显式对旧修订生成的结果直接落为 `expired`，不产生任何同步组**，同步内容不变。
+- 一次更正或生成的变更**整组可见**：变更组、组内变更与流物化状态 `sync_supply_state`
+  在同一个 `BEGIN IMMEDIATE` 事务内提交；并发操作或失败整体回滚，不留半组。
+- 从水位 0 顺序重放变更流（`withdrawn` 删除、`upsert` 覆盖）得到的状态，与
+  `GET /sync/supply` 快照完全一致；历史结果仍可通过 `GET /results/{id}` 查询。
+
 ## 启动方式
 
 ### Docker Compose（推荐）
@@ -56,7 +78,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 1. `POST /batches` 录入观测批次；
 2. `POST /taxonomies` 提交分类表（更正时再次调用即可，自动出新修订）；
 3. `POST /results` 生成供数结果；
-4. `GET /results/{result_id}` 查询明细，或 `GET /results?status=active` 查看当前供数。
+4. `GET /results/{result_id}` 查询明细，或 `GET /results?status=active` 查看当前供数；
+5. `GET /sync/supply` 首次读取当前可供数快照与水位；
+6. `GET /sync/changes?after=<水位>` 按水位续读变更组，用返回水位继续轮询。
 
 ## curl 示例
 
@@ -96,6 +120,13 @@ curl -s -X POST localhost:8000/results -H 'Content-Type: application/json' \
 
 # 4. 按结果号重读
 curl -s localhost:8000/results/1
+
+# 5. 下游首次读取：当前可供数快照 + 水位
+curl -s localhost:8000/sync/supply
+
+# 6. 按水位续读变更组（首次 after=0，之后用上一次响应的 watermark）
+curl -s "localhost:8000/sync/changes?after=0"
+# 分类表更正后再续读，会先收到 correction 撤下组；重新生成后收到 generation 新归属组
 ```
 
 ## API 一览
@@ -112,6 +143,8 @@ curl -s localhost:8000/results/1
 | POST | `/results` | 生成供数结果 |
 | GET | `/results` | 结果列表（可按 `batch_id`、`status` 过滤） |
 | GET | `/results/{id}` | 按结果号重读（含每条观测的追踪结论与原因） |
+| GET | `/sync/supply` | 首次读取：当前可供数全量快照 + 当前水位 |
+| GET | `/sync/changes` | 按水位领取变更组（`after`、`limit` 分页，幂等续读） |
 
 ## 测试
 
@@ -124,15 +157,20 @@ python -m pytest tests/ -q
 - `tests/test_api.py`：端到端业务场景（更正过期、旧修订不得激活、上限校验、404、结果冻结等）；
 - `tests/test_concurrency.py`：4 线程 100 次生成/更正交错，校验无部分结果、至多一份当前供数、
   active 必属最新修订、结果与串行重算一致。
+- `tests/test_sync.py`：同步流端到端（快照与水位一致、撤下/新归属、幂等续读、分页不漏组、
+  旧修订生成不改变同步内容、失败不留半组、流重放等于快照等）；
+- `tests/test_sync_concurrency.py`：4 线程 80 次生成/更正交错下同步流的整组完整性、
+  水位单调、续读幂等、流重放与快照一致、失败整体回滚。
 
 ## 目录结构
 
 ```
 app/
-  database.py    # SQLite 连接、建表、IMMEDIATE 写事务
+  database.py    # SQLite 连接、建表、IMMEDIATE 写事务与只读快照事务
   models.py      # Pydantic v2 请求/响应模型与上限校验
   resolver.py    # 名称追踪：可达性 + Kahn 环检测 + 汇聚判定
-  services.py    # 事务化业务服务（批次/修订/结果）
+  services.py    # 事务化业务服务（批次/修订/结果，事务内挂接同步组）
+  sync.py        # 供数同步：变更组（水位）、流物化状态、快照与续读
   main.py        # FastAPI 路由
 tests/           # pytest 测试
 Dockerfile, docker-compose.yml, requirements.txt

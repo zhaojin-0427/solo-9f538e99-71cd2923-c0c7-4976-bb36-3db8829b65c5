@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Query
 from sqlite3 import Connection
 
-from . import services
+from . import services, sync
 from .database import connect, init_db
 from .models import (
     BatchCreate,
@@ -21,6 +21,11 @@ from .models import (
     ResultDetailOut,
     ResultItemOut,
     ResultSummaryOut,
+    SyncChangeOut,
+    SyncChangesOut,
+    SyncGroupOut,
+    SyncSnapshotOut,
+    SyncSupplyItemOut,
     TaxonomyCreate,
     TaxonomyOut,
     TaxonomySummaryOut,
@@ -251,3 +256,79 @@ def get_result(result_id: int, conn: Connection = Depends(get_conn)):
     if services.get_result(conn, result_id) is None:
         raise HTTPException(status_code=404, detail=f"供数结果不存在：result_id={result_id}")
     return _row_to_result_detail(conn, result_id)
+
+
+# ---------- 供数同步（变更组 + 水位） ----------
+
+@app.get(
+    "/sync/supply",
+    response_model=SyncSnapshotOut,
+    tags=["供数同步"],
+    summary="首次读取：当前各批次已纳入供数的观测全量快照与当前水位",
+)
+def get_sync_snapshot(conn: Connection = Depends(get_conn)):
+    supply_rows, watermark = sync.read_snapshot(conn)
+    return SyncSnapshotOut(
+        watermark=watermark,
+        supply_count=len(supply_rows),
+        supply=[
+            SyncSupplyItemOut(
+                batch_id=r["batch_id"],
+                line_no=r["line_no"],
+                observation_code=r["observation_code"],
+                accepted_name=r["accepted_name"],
+                result_id=r["result_id"],
+            )
+            for r in supply_rows
+        ],
+    )
+
+
+@app.get(
+    "/sync/changes",
+    response_model=SyncChangesOut,
+    tags=["供数同步"],
+    summary="按水位领取变更组（after 为已读水位，返回水位用于续读，同水位重复请求结果一致）",
+)
+def get_sync_changes(
+    conn: Connection = Depends(get_conn),
+    after: int = Query(0, ge=0, description="已读水位；只返回水位严格大于它的变更组"),
+    limit: int = Query(
+        100, ge=1, le=500, description="本次最多返回的变更组数（每组内变更不限）"
+    ),
+):
+    group_rows, changes_by_group, has_more, response_watermark = sync.read_changes(
+        conn, after, limit
+    )
+    groups = [
+        SyncGroupOut(
+            watermark=g["watermark"],
+            group_type=g["group_type"],
+            batch_id=g["batch_id"],
+            trigger_result_id=g["trigger_result_id"],
+            created_at=g["created_at"],
+            changes=[
+                SyncChangeOut(
+                    group_id=r["group_id"],
+                    batch_id=r["batch_id"],
+                    observation_code=r["observation_code"],
+                    line_no=r["line_no"],
+                    change_type=r["change_type"],
+                    accepted_name=r["accepted_name"],
+                    result_id=r["result_id"],
+                    change_seq=r["change_seq"],
+                )
+                for r in changes_by_group.get(g["watermark"], [])
+            ],
+        )
+        for g in group_rows
+    ]
+    change_count = sum(len(g.changes) for g in groups)
+    return SyncChangesOut(
+        after=after,
+        watermark=response_watermark,
+        has_more=has_more,
+        group_count=len(groups),
+        change_count=change_count,
+        groups=groups,
+    )
